@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Computed,
     DateTime,
     Enum,
     ForeignKey,
@@ -77,8 +78,13 @@ class Chunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
-    # tsv is a GENERATED column managed by the DB; we don't write it from Python.
-    tsv = mapped_column(TSVECTOR)
+    # tsv is GENERATED ALWAYS AS (to_tsvector('english', content)) STORED in the
+    # DB (created by the Alembic migration). `Computed` tells SQLAlchemy this
+    # column is DB-managed so it is excluded from INSERT/UPDATE statements.
+    tsv = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', content)", persisted=True),
+    )
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
