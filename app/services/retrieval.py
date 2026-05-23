@@ -2,7 +2,6 @@
 combined via Reciprocal Rank Fusion (RRF)."""
 from __future__ import annotations
 
-import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -55,10 +54,9 @@ async def retrieve(
         """
     )
 
-    vector_rows, fts_rows = await asyncio.gather(
-        session.execute(vector_sql, {"k": candidate_k}),
-        session.execute(fts_sql, {"q": query, "k": candidate_k}),
-    )
+    # AsyncSession is single-flight: run queries sequentially, not via gather.
+    vector_rows = await session.execute(vector_sql, {"k": candidate_k})
+    fts_rows = await session.execute(fts_sql, {"q": query, "k": candidate_k})
 
     # Reciprocal Rank Fusion: score = sum(1 / (k + rank)) across rankings
     scores: dict[uuid.UUID, float] = {}

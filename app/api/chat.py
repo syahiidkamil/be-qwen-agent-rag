@@ -1,15 +1,20 @@
-"""Anonymous chat endpoint with SSE streaming."""
+"""Anonymous chat endpoint with SSE streaming.
+
+We do NOT use the request-scoped `Depends(get_db)` here because the
+StreamingResponse outlives the request handler, and SQLAlchemy raises
+IllegalStateChangeError when the session is closed (by the dependency
+teardown) while the stream is still iterating. Instead, each DB
+interaction opens its own short-lived session via the sessionmaker.
+"""
 from __future__ import annotations
 
 import json
 import uuid
-from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.db import get_db
+from app.core.db import _sessionmaker
 from app.models.chat import ChatMessage, ChatSession, MessageRole
 from app.schemas.chat import ChatRequest
 from app.services.chat import stream_answer
@@ -18,70 +23,79 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
 @router.post("")
-async def chat(
-    body: ChatRequest,
-    session: Annotated[AsyncSession, Depends(get_db)],
-):
+async def chat(body: ChatRequest):
     if not body.messages:
         raise HTTPException(
             status_code=400,
             detail={"error": {"code": "EMPTY_MESSAGES", "message": "messages must be non-empty"}},
         )
-    last_user = next(
-        (m for m in reversed(body.messages) if m.role == "user"), None
-    )
+    last_user = next((m for m in reversed(body.messages) if m.role == "user"), None)
     if last_user is None:
         raise HTTPException(
             status_code=400,
             detail={"error": {"code": "NO_USER_TURN", "message": "Last user message required"}},
         )
 
-    # Persist or load the chat session.
-    chat_session_id = body.session_id
-    if chat_session_id is None:
-        new_session = ChatSession()
-        session.add(new_session)
-        await session.commit()
-        await session.refresh(new_session)
-        chat_session_id = new_session.id
+    sessionmaker_ = _sessionmaker()
 
-    # Persist the user message before streaming.
-    session.add(
-        ChatMessage(
-            session_id=chat_session_id,
-            role=MessageRole.user,
-            content=last_user.content,
-        )
-    )
-    await session.commit()
+    # Resolve or create the chat session in its own short-lived DB session.
+    chat_session_id: uuid.UUID
+    if body.session_id is None:
+        async with sessionmaker_() as sess:
+            new_session = ChatSession()
+            sess.add(new_session)
+            await sess.commit()
+            await sess.refresh(new_session)
+            chat_session_id = new_session.id
+    else:
+        chat_session_id = body.session_id
 
-    history = [{"role": m.role, "content": m.content} for m in body.messages[:-1]]
-
-    async def event_stream():
-        # Emit the session id up front so the client can re-use it.
-        yield f"data: {json.dumps({'type': 'session', 'session_id': str(chat_session_id)})}\n\n"
-
-        last_sources = []
-        full_text = ""
-        async for event in stream_answer(session, last_user.content, history):
-            if event["type"] == "sources":
-                last_sources = event["sources"]
-            elif event["type"] == "token":
-                pass
-            elif event["type"] == "done":
-                full_text = event.get("full_text", "")
-            yield f"data: {json.dumps(event)}\n\n"
-
-        # Persist the assistant response.
-        session.add(
+    # Persist the user turn before streaming.
+    async with sessionmaker_() as sess:
+        sess.add(
             ChatMessage(
                 session_id=chat_session_id,
-                role=MessageRole.assistant,
-                content=full_text,
-                sources=last_sources,
+                role=MessageRole.user,
+                content=last_user.content,
             )
         )
-        await session.commit()
+        await sess.commit()
+
+    history = [{"role": m.role, "content": m.content} for m in body.messages[:-1]]
+    user_query = last_user.content
+
+    async def event_stream():
+        # Send the session id up front so the client can persist it.
+        yield f"data: {json.dumps({'type': 'session', 'session_id': str(chat_session_id)})}\n\n"
+
+        last_sources: list = []
+        full_text = ""
+
+        # Retrieval + LLM streaming happen inside their own session.
+        try:
+            async with sessionmaker_() as sess:
+                async for event in stream_answer(sess, user_query, history):
+                    if event["type"] == "sources":
+                        last_sources = event["sources"]
+                    elif event["type"] == "done":
+                        full_text = event.get("full_text", "") or full_text
+                    yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:  # noqa: BLE001 — surface to the client
+            err = {"type": "error", "code": type(exc).__name__, "message": str(exc)[:500]}
+            yield f"data: {json.dumps(err)}\n\n"
+
+        # Persist the assistant turn in its own session.
+        async with sessionmaker_() as sess:
+            sess.add(
+                ChatMessage(
+                    session_id=chat_session_id,
+                    role=MessageRole.assistant,
+                    content=full_text,
+                    sources=last_sources,
+                )
+            )
+            await sess.commit()
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -89,6 +103,6 @@ async def chat(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",  # disable proxy buffering on nginx
+            "X-Accel-Buffering": "no",
         },
     )

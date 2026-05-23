@@ -20,3 +20,4 @@ httpx>=0.27,<1.0
 
 # Qwen-Agent (RAG extras include DocParser, rank_bm25, pypdf, python-docx)
 qwen-agent[rag]>=0.0.20
+soundfile>=0.12,<1.0  # qwen-agent imports it unconditionally despite not declaring it

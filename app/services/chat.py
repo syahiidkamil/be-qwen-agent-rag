@@ -56,9 +56,13 @@ async def stream_answer(
         + "\n=== END CONTEXT ===\n"
     )
 
+    # Use the OpenAI-compatible endpoint (model_type "oai") so we hit the
+    # International DashScope base URL — the native "qwen_dashscope" mode
+    # defaults to the China endpoint and rejects International API keys.
     llm_cfg = {
         "model": settings.qwen_chat_model,
-        "model_type": "qwen_dashscope",
+        "model_type": "oai",
+        "model_server": settings.dashscope_base_url,
         "api_key": settings.dashscope_api_key,
         "generate_cfg": {
             "max_input_tokens": settings.qwen_max_input_tokens,
