@@ -40,3 +40,9 @@ htmlcov/
 .idea/
 *.swp
 *.swo
+
+# Qwen-Agent / DocParser cache (created at runtime by qwen-agent tools)
+workspace/
+
+# Claude Code local state (worktrees, settings)
+.claude/
