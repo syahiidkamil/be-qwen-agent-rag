@@ -11,10 +11,13 @@ from app.core.config import get_settings
 from app.services.retrieval import RetrievedChunk, retrieve
 
 GROUNDING_INSTRUCTION = """You are a knowledgebase assistant. Answer ONLY using
-the CONTEXT passages below. If the answer is not in the context, say you
-don't know — do not make up information from your general training.
+the CONTEXT passages below. If the CONTEXT does not contain the answer, reply
+with exactly: "I don't have information about that in my knowledge base." — do
+NOT make up information from your general training.
 
-Cite sources at the end of relevant sentences using the format [doc:<document_id>].
+Do NOT include any citation tags in your reply (no [doc:...], no [1], no
+footnote markers). The sources are displayed separately by the UI.
+
 Keep answers concise unless the user asks for detail.
 """
 
