@@ -5,9 +5,12 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.models.document import Document
+from app.services import storage
 from app.services.retrieval import RetrievedChunk, retrieve
 
 GROUNDING_INSTRUCTION = """You are a knowledgebase assistant. Answer ONLY using
@@ -43,11 +46,34 @@ async def stream_answer(
     settings = get_settings()
     chunks = await retrieve(session, query, top_k=8)
 
+    # Pull the filename + storage path for every cited document so the UI can
+    # render clickable source chips. Public bucket URLs are built directly;
+    # swap for signed URLs here if the bucket later becomes private.
+    doc_meta: dict[uuid.UUID, dict[str, str]] = {}
+    doc_ids = list({c.document_id for c in chunks})
+    if doc_ids:
+        rows = await session.execute(
+            select(Document.id, Document.filename, Document.storage_path).where(
+                Document.id.in_(doc_ids)
+            )
+        )
+        for row in rows.mappings().all():
+            doc_meta[row["id"]] = {
+                "filename": row["filename"],
+                "url": storage.public_url(row["storage_path"]),
+            }
+
     # Surface sources to the UI before streaming tokens.
     yield {
         "type": "sources",
         "sources": [
-            {"chunk_id": str(c.id), "document_id": str(c.document_id), "score": c.score}
+            {
+                "chunk_id": str(c.id),
+                "document_id": str(c.document_id),
+                "filename": doc_meta.get(c.document_id, {}).get("filename"),
+                "url": doc_meta.get(c.document_id, {}).get("url"),
+                "score": c.score,
+            }
             for c in chunks
         ],
     }

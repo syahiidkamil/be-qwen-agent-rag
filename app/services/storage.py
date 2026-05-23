@@ -30,3 +30,15 @@ def download_bytes(path: str) -> bytes:
 
 def remove(path: str) -> None:
     _bucket().remove([path])
+
+
+def public_url(path: str) -> str:
+    """Return the public URL for a storage object.
+
+    Only valid when the bucket is set to public in the Supabase dashboard.
+    For private buckets, generate a signed URL instead.
+    """
+    settings = get_settings()
+    base = settings.supabase_url.rstrip('/')
+    bucket = settings.supabase_storage_bucket
+    return f"{base}/storage/v1/object/public/{bucket}/{path}"
