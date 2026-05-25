@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -5,6 +7,12 @@ from app.api import chat as chat_router
 from app.api import documents as documents_router
 from app.api import landing_config as landing_config_router
 from app.core.config import get_settings
+
+# Surface our own loggers (app.perf, app.services.*) through uvicorn's stdout.
+# Uvicorn only opts its own namespace into INFO by default.
+logging.getLogger("app").setLevel(logging.INFO)
+if not logging.getLogger("app").handlers:
+    logging.getLogger("app").addHandler(logging.StreamHandler())
 
 settings = get_settings()
 
