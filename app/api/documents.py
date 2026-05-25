@@ -16,7 +16,7 @@ from fastapi import (
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import AuthUser, get_current_admin
+from app.core.auth import AuthUser, get_current_admin, require_role
 from app.core.db import get_db
 from app.models.document import Document, IngestStatus
 from app.schemas.document import DocumentOut
@@ -24,10 +24,14 @@ from app.services import ingestion, storage
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
+# Read access to the KB list is broader than write access: signed-in users
+# need it for the /workspace surface, but mutation is still admin-only.
+_require_any_role = require_role("user")
+
 
 @router.get("")
 async def list_documents(
-    _: Annotated[AuthUser, Depends(get_current_admin)],
+    _: Annotated[AuthUser, Depends(_require_any_role)],
     session: Annotated[AsyncSession, Depends(get_db)],
 ):
     result = await session.execute(
