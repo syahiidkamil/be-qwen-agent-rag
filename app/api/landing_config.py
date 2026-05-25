@@ -8,12 +8,16 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import AuthUser, get_current_admin
+from app.core.auth import AuthUser, require_role
 from app.core.db import get_db
 from app.models.landing_config import LandingConfig
 from app.schemas.landing_config import LandingConfigIn, LandingConfigOut
 
 router = APIRouter(prefix="/api/landing-config", tags=["landing-config"])
+
+# Brand presets + chat-mode toggle live behind this dep. Per DECISIONS.md
+# only super-admin can write; admin sees the read but not the write surface.
+_require_super_admin = require_role("super_admin")
 
 
 @router.get("")
@@ -32,7 +36,7 @@ async def get_landing_config(session: Annotated[AsyncSession, Depends(get_db)]):
 @router.put("")
 async def save_landing_config(
     body: LandingConfigIn,
-    user: Annotated[AuthUser, Depends(get_current_admin)],
+    user: Annotated[AuthUser, Depends(_require_super_admin)],
     session: Annotated[AsyncSession, Depends(get_db)],
 ):
     result = await session.execute(select(LandingConfig).where(LandingConfig.id == 1))
