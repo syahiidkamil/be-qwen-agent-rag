@@ -1,4 +1,4 @@
-"""FastAPI dependency that verifies a Supabase access token.
+"""FastAPI dependencies that verify Supabase tokens and enforce roles.
 
 Supabase migrated to asymmetric JWT Signing Keys: new session tokens are
 signed with the project's ECC (P-256) private key as ES256. We verify by
@@ -7,17 +7,23 @@ fetching the matching public key from the project's JWKS endpoint:
     {SUPABASE_URL}/auth/v1/.well-known/jwks.json
 
 The Legacy HS256 Shared Secret may still appear in the JWKS for tokens
-issued before the rotation; python-jose handles `oct` keys the same way.
+issued before the rotation; python-jose handles ``oct`` keys the same way.
 We also retain a config-level fallback to ``SUPABASE_JWT_SECRET`` so a
 fully legacy project (no signing-keys migration) keeps working.
 
-For now, *any* authenticated user is treated as admin. Tighten this with
-a role check (e.g., a `is_admin` flag in user metadata, or an `admins`
-table) before opening Supabase signups to the public.
+Authorization is performed by ``require_role(*roles)``: it decodes the
+token, reads ``user_metadata.role`` from the verified claims, and raises
+403 when the caller's role is missing, unknown, or not in the allowed
+set. ``get_current_admin`` is a thin alias for
+``require_role("admin")`` (which transitively allows super_admin via the
+privilege hierarchy below). ``get_current_user_optional`` is for routes
+that accept both authenticated and anonymous callers (the chat endpoint
+in internal-mode gating, for example).
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Annotated, Any
 
@@ -28,12 +34,18 @@ from jose import JWTError, jwt
 
 from app.core.config import Settings, get_settings
 
+logger = logging.getLogger("app.auth")
+
 _bearer = HTTPBearer(auto_error=False)
 
 _JWKS_TTL_SECONDS = 600
 _jwks_cache: dict[str, dict[str, Any]] = {}
 _jwks_fetched_at: float = 0.0
 _jwks_lock = asyncio.Lock()
+
+# Roles recognized by the system. Anything outside this set is treated as
+# unknown and rejected at the role check.
+KNOWN_ROLES: tuple[str, ...] = ("super_admin", "admin", "user")
 
 
 class AuthUser:
@@ -42,12 +54,26 @@ class AuthUser:
         self.email = email
         self.raw = raw
 
+    @property
+    def role(self) -> str | None:
+        """Extract role from `user_metadata.role`. Returns None if absent or non-string."""
+        metadata = self.raw.get("user_metadata") or {}
+        value = metadata.get("role")
+        return value if isinstance(value, str) else None
+
 
 def _unauthorized(code: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail={"error": {"code": code, "message": detail}},
         headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def _forbidden(code: str, detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": {"code": code, "message": detail}},
     )
 
 
@@ -126,12 +152,15 @@ def _decode_with_hs256_fallback(token: str, settings: Settings) -> dict[str, Any
     )
 
 
-async def get_current_admin(
-    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-    settings: Annotated[Settings, Depends(get_settings)],
+async def _decode_token(
+    credentials: HTTPAuthorizationCredentials,
+    settings: Settings,
 ) -> AuthUser:
-    if credentials is None:
-        raise _unauthorized("MISSING_TOKEN", "Missing bearer token")
+    """Verify a Supabase bearer token and return the AuthUser.
+
+    Raises 401 when the token is missing required claims, malformed, or
+    fails signature verification. Does not enforce any role policy.
+    """
     if not settings.supabase_url:
         raise HTTPException(
             status_code=500,
@@ -164,3 +193,88 @@ async def get_current_admin(
     if not sub:
         raise _unauthorized("INVALID_TOKEN", "Token missing subject")
     return AuthUser(sub=sub, email=claims.get("email"), raw=claims)
+
+
+def _expand_role_hierarchy(roles: tuple[str, ...]) -> frozenset[str]:
+    """Expand the allowed set to include higher-privilege roles.
+
+    super_admin > admin > user. A route that allows "admin" implicitly
+    allows "super_admin" since super-admins have a superset of admin
+    privileges. Likewise, "user" implies "admin" and "super_admin".
+    """
+    expanded = set(roles)
+    if "user" in expanded:
+        expanded.update(("admin", "super_admin"))
+    if "admin" in expanded:
+        expanded.add("super_admin")
+    return frozenset(expanded)
+
+
+def require_role(*allowed_roles: str):
+    """Return a FastAPI dependency that enforces the caller's role.
+
+    Behavior:
+        - 401 if no bearer token is present, or if the token is malformed,
+          expired, or has an invalid signature.
+        - 403 if the token is valid but `user_metadata.role` is missing,
+          unknown, or not in the allowed set (after hierarchy expansion).
+        - Returns the AuthUser on success.
+
+    The hierarchy is enforced via ``_expand_role_hierarchy``: ``require_role("admin")``
+    accepts both `admin` and `super_admin`; ``require_role("user")`` accepts all three.
+    """
+    if not allowed_roles:
+        raise ValueError("require_role requires at least one allowed role")
+    for role in allowed_roles:
+        if role not in KNOWN_ROLES:
+            raise ValueError(f"Unknown role passed to require_role: {role!r}")
+
+    permitted = _expand_role_hierarchy(allowed_roles)
+
+    async def dependency(
+        credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+        settings: Annotated[Settings, Depends(get_settings)],
+    ) -> AuthUser:
+        if credentials is None:
+            raise _unauthorized("MISSING_TOKEN", "Missing bearer token")
+        user = await _decode_token(credentials, settings)
+        role = user.role
+        if role is None:
+            raise _forbidden(
+                "FORBIDDEN",
+                "Account role missing — contact your administrator",
+            )
+        if role not in KNOWN_ROLES:
+            logger.info("Unknown role on token: sub=%s role=%r", user.sub, role)
+            raise _forbidden("FORBIDDEN", "Unrecognized account role")
+        if role not in permitted:
+            raise _forbidden(
+                "FORBIDDEN",
+                f"This action requires one of: {', '.join(sorted(permitted))}",
+            )
+        return user
+
+    dependency.__name__ = f"require_role_{'_'.join(allowed_roles)}"
+    return dependency
+
+
+async def get_current_user_optional(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AuthUser | None:
+    """Return AuthUser when a valid token is present; None when no token at all.
+
+    Used by endpoints that legitimately accept anonymous callers (e.g. the
+    chat endpoint in public mode). A present-but-invalid token still raises
+    401 — anonymity is distinct from a broken credential.
+    """
+    if credentials is None:
+        return None
+    return await _decode_token(credentials, settings)
+
+
+# Backwards-compatible alias for existing routes that called `get_current_admin`
+# before role enforcement existed. require_role("admin") accepts both admin and
+# super_admin via the privilege hierarchy.
+get_current_admin = require_role("admin")
+get_current_admin.__name__ = "get_current_admin"
