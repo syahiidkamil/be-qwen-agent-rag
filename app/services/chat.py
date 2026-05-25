@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator
 
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.perf import mark, probe
 from app.models.document import Document
 from app.services import storage
 from app.services.retrieval import RetrievedChunk, retrieve
@@ -39,10 +41,11 @@ async def stream_answer(
     session: AsyncSession,
     query: str,
     history: list[dict],
+    session_id: str | None = None,
 ) -> AsyncIterator[dict]:
     """Yield SSE-event-shaped dicts: {'type': 'token'|'sources'|'done', ...}."""
     settings = get_settings()
-    chunks = await retrieve(session, query, top_k=8)
+    chunks = await retrieve(session, query, top_k=8, session_id=session_id)
 
     # Pull the filename + storage path for every cited document so the UI can
     # render clickable source chips. Public bucket URLs are built directly;
@@ -50,11 +53,12 @@ async def stream_answer(
     doc_meta: dict[uuid.UUID, dict[str, str]] = {}
     doc_ids = list({c.document_id for c in chunks})
     if doc_ids:
-        rows = await session.execute(
-            select(Document.id, Document.filename, Document.storage_path).where(
-                Document.id.in_(doc_ids)
+        async with probe("doc_metadata", session_id):
+            rows = await session.execute(
+                select(Document.id, Document.filename, Document.storage_path).where(
+                    Document.id.in_(doc_ids)
+                )
             )
-        )
         for row in rows.mappings().all():
             doc_meta[row["id"]] = {
                 "filename": row["filename"],
@@ -96,12 +100,15 @@ async def stream_answer(
             "top_p": 0.8,
         },
     }
-    bot = Assistant(llm=llm_cfg, system_message=system_message)
+    async with probe("assistant_build", session_id):
+        bot = Assistant(llm=llm_cfg, system_message=system_message)
 
     # Build the message list (history + new user turn).
     messages = list(history) + [{"role": "user", "content": query}]
 
     last_text = ""
+    stream_t0 = time.perf_counter()
+    ttft_marked = False
     for responses in bot.run(messages=messages):
         # qwen-agent streams a list of Message dicts. The assistant message
         # accumulates content; we yield the delta only.
@@ -117,6 +124,10 @@ async def stream_answer(
         if text_now and text_now != last_text:
             delta = text_now[len(last_text):]
             last_text = text_now
+            if not ttft_marked:
+                mark("ttft", stream_t0, session_id)
+                ttft_marked = True
             yield {"type": "token", "delta": delta}
 
+    mark("stream_total", stream_t0, session_id)
     yield {"type": "done", "full_text": last_text}

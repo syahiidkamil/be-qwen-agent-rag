@@ -2,12 +2,14 @@
 combined via Reciprocal Rank Fusion (RRF)."""
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.perf import mark, probe
 from app.services.embedding import cached_query_embedding
 
 RRF_K = 60  # smoothing constant; classic default
@@ -26,13 +28,15 @@ async def retrieve(
     query: str,
     top_k: int = 8,
     candidate_k: int = 25,
+    session_id: str | None = None,
 ) -> list[RetrievedChunk]:
     """Return the top_k most relevant chunks for `query`."""
     if not query.strip():
         return []
 
     # Vector arm: embed query once (cached) and rank by cosine distance.
-    q_emb = await cached_query_embedding(query)
+    async with probe("embed_query", session_id):
+        q_emb = await cached_query_embedding(query)
     q_emb_literal = "[" + ",".join(f"{x:.8f}" for x in q_emb) + "]"
 
     vector_sql = text(
@@ -55,10 +59,13 @@ async def retrieve(
     )
 
     # AsyncSession is single-flight: run queries sequentially, not via gather.
-    vector_rows = await session.execute(vector_sql, {"k": candidate_k})
-    fts_rows = await session.execute(fts_sql, {"q": query, "k": candidate_k})
+    async with probe("vector_sql", session_id):
+        vector_rows = await session.execute(vector_sql, {"k": candidate_k})
+    async with probe("fts_sql", session_id):
+        fts_rows = await session.execute(fts_sql, {"q": query, "k": candidate_k})
 
     # Reciprocal Rank Fusion: score = sum(1 / (k + rank)) across rankings
+    rrf_t0 = time.perf_counter()
     scores: dict[uuid.UUID, float] = {}
     payload: dict[uuid.UUID, RetrievedChunk] = {}
 
@@ -81,4 +88,5 @@ async def retrieve(
         payload[chunk_id].score = total
 
     ranked = sorted(payload.values(), key=lambda c: c.score, reverse=True)
+    mark("rrf", rrf_t0, session_id)
     return ranked[:top_k]

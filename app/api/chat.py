@@ -74,7 +74,9 @@ async def chat(body: ChatRequest):
         # Retrieval + LLM streaming happen inside their own session.
         try:
             async with sessionmaker_() as sess:
-                async for event in stream_answer(sess, user_query, history):
+                async for event in stream_answer(
+                    sess, user_query, history, session_id=str(chat_session_id)
+                ):
                     if event["type"] == "sources":
                         last_sources = event["sources"]
                     elif event["type"] == "done":
