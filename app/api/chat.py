@@ -10,20 +10,58 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 
+from app.core.auth import AuthUser, get_current_user_optional
 from app.core.db import _sessionmaker
 from app.models.chat import ChatMessage, ChatSession, MessageRole
+from app.models.landing_config import LandingConfig
 from app.schemas.chat import ChatRequest
 from app.services.chat import stream_answer
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
+async def _current_chat_mode() -> str:
+    """Read chat_mode from the singleton landing_config row.
+
+    Defensive default of ``public`` covers: row missing, key missing,
+    bad value from direct DB tampering. The FE will see the same default
+    via the LandingConfigOut normaliser. Lives in this module rather
+    than the schemas package because nothing else reads chat_mode in
+    isolation right now.
+    """
+    sessionmaker_ = _sessionmaker()
+    async with sessionmaker_() as sess:
+        result = await sess.execute(select(LandingConfig).where(LandingConfig.id == 1))
+        row = result.scalar_one_or_none()
+    if row is None:
+        return "public"
+    value = (row.config or {}).get("chat_mode")
+    return value if value in ("public", "internal") else "public"
+
+
 @router.post("")
-async def chat(body: ChatRequest):
+async def chat(
+    body: ChatRequest,
+    user: Annotated[AuthUser | None, Depends(get_current_user_optional)] = None,
+):
+    # Internal-mode gating. Authoritative — the FE's "Sign in to chat"
+    # card is UX, this 401 is what actually blocks unauthenticated POSTs.
+    mode = await _current_chat_mode()
+    if mode == "internal" and user is None:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {
+                "code": "INTERNAL_MODE_REQUIRES_AUTH",
+                "message": "Sign in to chat.",
+            }},
+        )
+
     if not body.messages:
         raise HTTPException(
             status_code=400,
