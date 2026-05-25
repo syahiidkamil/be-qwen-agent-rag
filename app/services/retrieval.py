@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.embedding import embed_batch
+from app.services.embedding import cached_query_embedding
 
 RRF_K = 60  # smoothing constant; classic default
 
@@ -31,8 +31,8 @@ async def retrieve(
     if not query.strip():
         return []
 
-    # Vector arm: embed query once and rank by cosine distance.
-    q_emb = (await embed_batch([query]))[0]
+    # Vector arm: embed query once (cached) and rank by cosine distance.
+    q_emb = await cached_query_embedding(query)
     q_emb_literal = "[" + ",".join(f"{x:.8f}" for x in q_emb) + "]"
 
     vector_sql = text(
