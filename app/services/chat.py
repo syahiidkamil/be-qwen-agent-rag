@@ -5,6 +5,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 
+from qwen_agent.agents import Assistant
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,9 +41,6 @@ async def stream_answer(
     history: list[dict],
 ) -> AsyncIterator[dict]:
     """Yield SSE-event-shaped dicts: {'type': 'token'|'sources'|'done', ...}."""
-    # Imported lazily — qwen-agent has heavy deps.
-    from qwen_agent.agents import Assistant
-
     settings = get_settings()
     chunks = await retrieve(session, query, top_k=8)
 
