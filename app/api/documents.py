@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import AuthUser, get_current_admin, require_role
 from app.core.db import get_db
 from app.models.document import Document, IngestStatus
-from app.schemas.document import DocumentOut, DocumentRenameIn
+from app.schemas.document import DocumentOut, DocumentUpdateIn
 from app.services import ingestion, storage
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -167,19 +167,71 @@ def _validate_filename(raw: str) -> str:
     return cleaned
 
 
+_MAX_TAGS = 16
+_MAX_TAG_LEN = 32
+
+
+def _invalid_tags(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail={"error": {"code": "INVALID_TAGS", "message": message}},
+    )
+
+
+def _validate_tags(raw: list[str]) -> list[str]:
+    """Clean + validate a tag list. Returns lowercased, trimmed, deduped tags.
+
+    Rules: each tag 1–32 chars after strip; no path separators or null
+    bytes; case-folded; dedupe preserving order; at most 16 tags per doc.
+    An empty list is valid (clears all tags on PATCH).
+    """
+    if not isinstance(raw, list):
+        raise _invalid_tags("tags must be a list of strings")
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise _invalid_tags("each tag must be a string")
+        normalized = item.strip().lower()
+        if not normalized:
+            continue
+        if len(normalized) > _MAX_TAG_LEN:
+            raise _invalid_tags(f"each tag must be {_MAX_TAG_LEN} characters or fewer")
+        for ch in _FORBIDDEN_FILENAME_CHARS:
+            if ch in normalized:
+                raise _invalid_tags("tags cannot contain path separators or null bytes")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+
+    if len(cleaned) > _MAX_TAGS:
+        raise _invalid_tags(f"at most {_MAX_TAGS} tags per document")
+    return cleaned
+
+
 @router.patch("/{doc_id}")
-async def rename_document(
+async def update_document(
     doc_id: uuid.UUID,
-    body: DocumentRenameIn,
+    body: DocumentUpdateIn,
     _: Annotated[AuthUser, Depends(get_current_admin)],
     session: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Rename a document. Updates the filename column only; storage_path,
-    chunks, and the underlying Supabase Storage object are untouched.
-    Source chips on future chat answers pick up the new filename because
-    the chat service reads documents.filename at retrieval time.
+    """Patch a document's filename and/or tags. Both fields are optional;
+    only the provided ones are persisted. The Storage object, chunks,
+    and ingestion state are not touched. Source chips on future chat
+    answers pick up the new filename because the chat service reads
+    documents.filename at retrieval time.
     """
-    cleaned = _validate_filename(body.filename)
+    if body.filename is None and body.tags is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "EMPTY_PATCH", "message": "At least one of  or  must be provided."}},
+        )
+
+    cleaned_filename = _validate_filename(body.filename) if body.filename is not None else None
+    cleaned_tags = _validate_tags(body.tags) if body.tags is not None else None
 
     doc = await session.get(Document, doc_id)
     if doc is None:
@@ -187,7 +239,11 @@ async def rename_document(
             status_code=404,
             detail={"error": {"code": "NOT_FOUND", "message": "Document not found"}},
         )
-    doc.filename = cleaned
+
+    if cleaned_filename is not None:
+        doc.filename = cleaned_filename
+    if cleaned_tags is not None:
+        doc.tags = cleaned_tags
     await session.commit()
     await session.refresh(doc)
     return {"data": DocumentOut.model_validate(doc).model_dump(mode="json")}

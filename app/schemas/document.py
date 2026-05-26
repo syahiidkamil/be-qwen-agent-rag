@@ -17,19 +17,21 @@ class DocumentOut(BaseModel):
     status: IngestStatus
     chunk_count: int
     error_message: str | None
+    tags: list[str]
     uploaded_at: datetime
 
     class Config:
         from_attributes = True
 
 
-class DocumentRenameIn(BaseModel):
-    """Body for PATCH /api/documents/{id} — rename only.
+class DocumentUpdateIn(BaseModel):
+    """Body for PATCH /api/documents/{id}.
 
-    Validation lives at the route layer because the rules (length, trim,
-    no path separators) are easier to express imperatively than as
-    pydantic constraints. The field accepts any non-empty string here so
-    we can return a structured 400 with a specific code at the route.
+    Both fields are optional — PATCH semantics. Any omitted field is left
+    untouched on the row. Validation (length, trim, path separators, tag
+    count) is done at the route layer so each rule maps to a specific
+    error code in the structured 400 response.
     """
 
-    filename: str
+    filename: str | None = None
+    tags: list[str] | None = None
