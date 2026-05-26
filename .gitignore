@@ -5,6 +5,13 @@ __pycache__/
 *.so
 .Python
 
+# Node — this is a Python repo, but a stray `npm install` run from
+# here would otherwise dump 100k+ tracked files into the working tree.
+# Belt-and-braces ignore in case a tool's cwd drifts.
+node_modules/
+package.json
+package-lock.json
+
 # Virtualenv
 .venv/
 venv/

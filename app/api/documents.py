@@ -18,9 +18,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser, get_current_admin, require_role
 from app.core.db import get_db
-from app.models.document import Document, IngestStatus
-from app.schemas.document import DocumentOut, DocumentUpdateIn
-from app.services import ingestion, storage
+from app.models.document import Chunk, Document, IngestStatus
+from app.schemas.document import (
+    ChunkOut,
+    DocumentOut,
+    DocumentUpdateIn,
+    SearchHitDocumentOut,
+    SearchHitOut,
+    SearchIn,
+)
+from app.services import ingestion, retrieval, storage
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -83,7 +90,7 @@ async def upload_document(
 @router.get("/{doc_id}")
 async def get_document(
     doc_id: uuid.UUID,
-    _: Annotated[AuthUser, Depends(get_current_admin)],
+    _: Annotated[AuthUser, Depends(_require_any_role)],
     session: Annotated[AsyncSession, Depends(get_db)],
 ):
     doc = await session.get(Document, doc_id)
@@ -121,6 +128,82 @@ async def get_document_view_url(
             detail={"error": {"code": "STORAGE_SIGN_FAILED", "message": str(exc)}},
         ) from exc
     return {"data": {"url": url, "filename": doc.filename}}
+
+
+@router.post("/search")
+async def search_documents(
+    body: SearchIn,
+    _: Annotated[AuthUser, Depends(_require_any_role)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Hybrid corpus search (vector + FTS via RRF) returning ranked chunks
+    with their source document metadata.
+
+    Reuses the same retrieval pipeline that grounds the chat endpoint, so
+    a working query here implies a working query at chat time. Empty
+    queries short-circuit without calling the embedder.
+    """
+    query = body.query.strip()
+    if not query:
+        return {"data": []}
+
+    top_k = max(1, min(body.top_k, 20))
+    hits = await retrieval.retrieve(session, query, top_k=top_k)
+    if not hits:
+        return {"data": []}
+
+    # Bulk-join document metadata so the FE can render each row without
+    # a follow-up call. Pattern lifted from chat.py.
+    doc_ids = {hit.document_id for hit in hits}
+    docs_result = await session.execute(select(Document).where(Document.id.in_(doc_ids)))
+    docs_by_id = {d.id: d for d in docs_result.scalars().all()}
+
+    out: list[SearchHitOut] = []
+    for hit in hits:
+        doc = docs_by_id.get(hit.document_id)
+        if doc is None:
+            # Chunk references a document that has since been deleted —
+            # skip rather than 500. Ingestion cleanup should catch these
+            # in practice.
+            continue
+        out.append(
+            SearchHitOut(
+                chunk_id=hit.id,
+                document_id=hit.document_id,
+                content=hit.content,
+                score=hit.score,
+                document=SearchHitDocumentOut(
+                    id=doc.id,
+                    filename=doc.filename,
+                    mime_type=doc.mime_type,
+                    status=doc.status,
+                    tags=list(doc.tags or []),
+                ),
+            )
+        )
+    return {"data": [hit.model_dump(mode="json") for hit in out]}
+
+
+@router.get("/{doc_id}/chunks/{chunk_id}")
+async def get_chunk(
+    doc_id: uuid.UUID,
+    chunk_id: uuid.UUID,
+    _: Annotated[AuthUser, Depends(_require_any_role)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Fetch a single chunk by id — backs the document-viewer deep-link.
+
+    We don't trust the chunk text via query string for the highlight; the
+    viewer asks the server. 404 covers both "chunk doesn't exist" and
+    "chunk belongs to a different document".
+    """
+    chunk = await session.get(Chunk, chunk_id)
+    if chunk is None or chunk.document_id != doc_id:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Chunk not found"}},
+        )
+    return {"data": ChunkOut.model_validate(chunk).model_dump(mode="json")}
 
 
 @router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)

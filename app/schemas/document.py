@@ -35,3 +35,43 @@ class DocumentUpdateIn(BaseModel):
 
     filename: str | None = None
     tags: list[str] | None = None
+
+
+class SearchIn(BaseModel):
+    """Body for POST /api/documents/search — corpus-wide hybrid query."""
+
+    query: str
+    top_k: int = 8
+
+
+class SearchHitDocumentOut(BaseModel):
+    """Document metadata included with every chunk hit so the FE can render
+    the result row without a second round-trip."""
+
+    id: uuid.UUID
+    filename: str
+    mime_type: str | None
+    status: IngestStatus
+    tags: list[str]
+
+
+class SearchHitOut(BaseModel):
+    """One ranked chunk returned from POST /api/documents/search."""
+
+    chunk_id: uuid.UUID
+    document_id: uuid.UUID
+    content: str
+    score: float
+    document: SearchHitDocumentOut
+
+
+class ChunkOut(BaseModel):
+    """Single chunk fetched by id — backs the document viewer deep-link."""
+
+    id: uuid.UUID
+    document_id: uuid.UUID
+    chunk_index: int
+    content: str
+
+    class Config:
+        from_attributes = True
