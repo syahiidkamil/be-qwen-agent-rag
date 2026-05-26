@@ -42,3 +42,19 @@ def public_url(path: str) -> str:
     base = settings.supabase_url.rstrip('/')
     bucket = settings.supabase_storage_bucket
     return f"{base}/storage/v1/object/public/{bucket}/{path}"
+
+
+def signed_url(path: str, expires_in: int = 300) -> str:
+    """Generate a time-limited signed URL for a private storage object.
+
+    Returned URL embeds its own auth token, so the browser can fetch the
+    object directly without our access token in headers — which is what
+    we want for opening a file in a new tab. Default lifetime: 5 minutes.
+    """
+    result = _bucket().create_signed_url(path, expires_in)
+    # supabase-py returns one of these key shapes across versions; tolerate
+    # both rather than pinning a version.
+    url = result.get("signedURL") or result.get("signed_url") or result.get("url")
+    if not url:
+        raise RuntimeError(f"signed_url: unexpected response shape: {result!r}")
+    return url

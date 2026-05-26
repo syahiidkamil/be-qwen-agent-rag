@@ -95,6 +95,34 @@ async def get_document(
     return {"data": DocumentOut.model_validate(doc).model_dump(mode="json")}
 
 
+@router.get("/{doc_id}/view-url")
+async def get_document_view_url(
+    doc_id: uuid.UUID,
+    _: Annotated[AuthUser, Depends(_require_any_role)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Return a short-lived signed URL the browser can open in a new tab.
+
+    Read-access only — same gate as the list endpoint (any signed-in
+    role can preview a document). The URL embeds its own auth so the
+    new tab doesn't need our bearer token.
+    """
+    doc = await session.get(Document, doc_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Document not found"}},
+        )
+    try:
+        url = storage.signed_url(doc.storage_path, expires_in=300)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail={"error": {"code": "STORAGE_SIGN_FAILED", "message": str(exc)}},
+        ) from exc
+    return {"data": {"url": url, "filename": doc.filename}}
+
+
 @router.delete("/{doc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
     doc_id: uuid.UUID,
