@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import AuthUser, get_current_admin, require_role
 from app.core.db import get_db
 from app.models.document import Document, IngestStatus
-from app.schemas.document import DocumentOut
+from app.schemas.document import DocumentOut, DocumentRenameIn
 from app.services import ingestion, storage
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
@@ -134,4 +134,60 @@ async def reingest_document(
     doc.error_message = None
     await session.commit()
     background.add_task(ingestion.ingest_document, doc_id)
+    return {"data": DocumentOut.model_validate(doc).model_dump(mode="json")}
+
+
+_FORBIDDEN_FILENAME_CHARS = ("/", "\\", "\x00")
+
+
+def _validate_filename(raw: str) -> str:
+    """Trim + validate a rename input. Returns the cleaned value or raises 400."""
+    if not isinstance(raw, str):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "INVALID_FILENAME", "message": "filename must be a string"}},
+        )
+    cleaned = raw.strip()
+    if not cleaned:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "INVALID_FILENAME", "message": "filename cannot be empty"}},
+        )
+    if len(cleaned) > 255:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": "INVALID_FILENAME", "message": "filename must be 255 characters or fewer"}},
+        )
+    for ch in _FORBIDDEN_FILENAME_CHARS:
+        if ch in cleaned:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"code": "INVALID_FILENAME", "message": "filename cannot contain path separators or null bytes"}},
+            )
+    return cleaned
+
+
+@router.patch("/{doc_id}")
+async def rename_document(
+    doc_id: uuid.UUID,
+    body: DocumentRenameIn,
+    _: Annotated[AuthUser, Depends(get_current_admin)],
+    session: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Rename a document. Updates the filename column only; storage_path,
+    chunks, and the underlying Supabase Storage object are untouched.
+    Source chips on future chat answers pick up the new filename because
+    the chat service reads documents.filename at retrieval time.
+    """
+    cleaned = _validate_filename(body.filename)
+
+    doc = await session.get(Document, doc_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {"code": "NOT_FOUND", "message": "Document not found"}},
+        )
+    doc.filename = cleaned
+    await session.commit()
+    await session.refresh(doc)
     return {"data": DocumentOut.model_validate(doc).model_dump(mode="json")}

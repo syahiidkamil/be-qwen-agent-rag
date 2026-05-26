@@ -21,3 +21,15 @@ class DocumentOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class DocumentRenameIn(BaseModel):
+    """Body for PATCH /api/documents/{id} — rename only.
+
+    Validation lives at the route layer because the rules (length, trim,
+    no path separators) are easier to express imperatively than as
+    pydantic constraints. The field accepts any non-empty string here so
+    we can return a structured 400 with a specific code at the route.
+    """
+
+    filename: str
