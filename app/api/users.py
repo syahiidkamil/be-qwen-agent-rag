@@ -114,19 +114,23 @@ def _bad_gateway(message: str) -> HTTPException:
 
 
 def _looks_like_email_conflict(exc: Exception) -> bool:
-    """Heuristic for Supabase 'email already exists' errors.
+    """Heuristic for Supabase "email already exists" errors.
 
-    gotrue returns several shapes here (HTTPError with body, AuthError with
-    `message`, dict-style); we check the stringified exception for the
-    canonical phrasing.
+    gotrue's canonical phrasing today is "A user with this email address has
+    already been registered" (note the "been" between "already" and
+    "registered"). Older releases said "already exists" or "duplicate".
+    Stringify the exception and check for any of these markers.
     """
     msg = str(exc).lower()
-    return (
-        "already registered" in msg
-        or "already exists" in msg
-        or "duplicate" in msg
-        or "email address" in msg and "exists" in msg
-    )
+    if "already" in msg and ("register" in msg or "exist" in msg):
+        return True
+    if "duplicate" in msg and ("key" in msg or "email" in msg):
+        return True
+    # Some supabase-py builds expose .code on AuthApiError.
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code in ("email_exists", "user_already_exists"):
+        return True
+    return False
 
 
 # ---------- endpoints -------------------------------------------------------
