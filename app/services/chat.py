@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.perf import mark, probe
 from app.models.document import Document
+from app.models.system_config import SystemConfig
+from app.schemas.system_config import resolve_retrieval_top_k
 from app.services import storage
 from app.services.retrieval import RetrievedChunk, retrieve
 
@@ -45,7 +47,12 @@ async def stream_answer(
 ) -> AsyncIterator[dict]:
     """Yield SSE-event-shaped dicts: {'type': 'token'|'sources'|'done', ...}."""
     settings = get_settings()
-    chunks = await retrieve(session, query, top_k=8, session_id=session_id)
+
+    sys_row = await session.execute(select(SystemConfig).where(SystemConfig.id == 1))
+    top_k = resolve_retrieval_top_k(
+        getattr(sys_row.scalar_one_or_none(), "config", None)
+    )
+    chunks = await retrieve(session, query, top_k=top_k, session_id=session_id)
 
     # Pull the filename + storage path for every cited document so the UI can
     # render clickable source chips. Public bucket URLs are built directly;
