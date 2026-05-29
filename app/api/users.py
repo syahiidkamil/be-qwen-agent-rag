@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.auth import AuthUser, require_role
 from app.core.supabase import get_supabase
-from app.schemas.user import Role, UserCreateIn, UserOut, UserStatus
+from app.schemas.user import Role, UserCreateIn, UserOut, UserStatus, UserUpdateIn
 
 log = logging.getLogger("app.api.users")
 
@@ -103,6 +103,13 @@ def _not_found(message: str) -> HTTPException:
     return HTTPException(
         status_code=404,
         detail={"error": {"code": "NOT_FOUND", "message": message}},
+    )
+
+
+def _forbidden(code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail={"error": {"code": code, "message": message}},
     )
 
 
@@ -292,3 +299,111 @@ async def reactivate_user(
     if raw_updated is None:
         raw_updated = raw_user
     return {"data": _project_user(raw_updated).model_dump(mode="json")}
+
+
+@router.patch("/{user_id}")
+async def update_user(
+    user_id: str,
+    body: UserUpdateIn,
+    _: Annotated[AuthUser, Depends(_require_admin)],
+):
+    """Update a user's email (admin-forced).
+
+    The new address is marked confirmed immediately — this project has no
+    email-verification flow, matching create_user's ``email_confirm=True``.
+    Returns 409 on email collision and 404 if the user does not exist.
+
+    The generic ``/{user_id}`` route is declared last on purpose. A
+    ``{user_id}`` path segment never swallows the two-segment
+    ``/deactivate`` / ``/reactivate`` routes, but keeping the catch-all
+    last is the clearer contract.
+    """
+    sb = get_supabase()
+    # Existence-check first so a bad id yields a clean 404 rather than a 502
+    # wrapping a Supabase error string (same pattern as deactivate/reactivate).
+    try:
+        existing = sb.auth.admin.get_user_by_id(user_id)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "not found" in msg:
+            raise _not_found(f"User {user_id} not found") from exc
+        log.exception("update_user: lookup failed for %s", user_id)
+        raise _bad_gateway(f"Supabase get_user_by_id failed: {exc}") from exc
+
+    raw_user = (
+        getattr(existing, "user", None) if not isinstance(existing, dict) else existing.get("user")
+    )
+    if raw_user is None:
+        raise _not_found(f"User {user_id} not found")
+
+    try:
+        result = sb.auth.admin.update_user_by_id(
+            user_id,
+            {"email": str(body.email), "email_confirm": True},
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _looks_like_email_conflict(exc):
+            raise _conflict("EMAIL_EXISTS", "A user with that email already exists.") from exc
+        log.exception("update_user failed for %s", user_id)
+        raise _bad_gateway(f"Supabase update_user_by_id failed: {exc}") from exc
+
+    raw_updated = getattr(result, "user", None) if not isinstance(result, dict) else result.get("user")
+    if raw_updated is None:
+        raw_updated = raw_user
+    return {"data": _project_user(raw_updated).model_dump(mode="json")}
+
+
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+    user_id: str,
+    caller: Annotated[AuthUser, Depends(_require_admin)],
+):
+    """Permanently delete a user from Supabase Auth (hard delete).
+
+    Guards, in order:
+      * Self-delete is refused (you cannot delete your own account) — same
+        defense-in-depth as deactivate_user.
+      * ``super_admin`` accounts are protected and cannot be deleted by
+        anyone. The FE also hides the button on those rows, but a
+        hand-crafted request must still bounce (403).
+
+    Returns 404 if the user does not exist, 204 on success.
+    """
+    if caller.sub == user_id:
+        raise _bad_request(
+            "SELF_DELETE_FORBIDDEN",
+            "You cannot delete your own account.",
+        )
+
+    sb = get_supabase()
+    # Look up the target first: a clean 404 for bad ids, and the role read
+    # we need to protect super_admins.
+    try:
+        existing = sb.auth.admin.get_user_by_id(user_id)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "not found" in msg:
+            raise _not_found(f"User {user_id} not found") from exc
+        log.exception("delete_user: lookup failed for %s", user_id)
+        raise _bad_gateway(f"Supabase get_user_by_id failed: {exc}") from exc
+
+    raw_user = (
+        getattr(existing, "user", None) if not isinstance(existing, dict) else existing.get("user")
+    )
+    if raw_user is None:
+        raise _not_found(f"User {user_id} not found")
+
+    if _project_user(raw_user).role == "super_admin":
+        raise _forbidden(
+            "SUPER_ADMIN_DELETE_FORBIDDEN",
+            "Super admin accounts cannot be deleted.",
+        )
+
+    try:
+        # supabase-py defaults to a hard delete (should_soft_delete=False).
+        sb.auth.admin.delete_user(user_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("delete_user failed for %s", user_id)
+        raise _bad_gateway(f"Supabase delete_user failed: {exc}") from exc
+
+    return None

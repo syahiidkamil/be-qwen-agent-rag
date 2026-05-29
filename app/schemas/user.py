@@ -23,6 +23,17 @@ class UserCreateIn(BaseModel):
     role: Role
 
 
+class UserUpdateIn(BaseModel):
+    """Body for PATCH /api/users/{user_id} — partial update.
+
+    Only email is updatable today; role and password changes are out of
+    scope. EmailStr gives format validation + normalization for free, the
+    same as UserCreateIn.
+    """
+
+    email: EmailStr
+
+
 class UserOut(BaseModel):
     """Projection sent to the frontend. Hide internal Supabase fields."""
 
