@@ -14,7 +14,10 @@ from app.core.config import get_settings
 from app.core.perf import mark, probe
 from app.models.document import Document
 from app.models.system_config import SystemConfig
-from app.schemas.system_config import resolve_retrieval_top_k
+from app.schemas.system_config import (
+    resolve_retrieval_max_files,
+    resolve_retrieval_top_k,
+)
 from app.services import storage
 from app.services.retrieval import RetrievedChunk, retrieve
 
@@ -49,10 +52,23 @@ async def stream_answer(
     settings = get_settings()
 
     sys_row = await session.execute(select(SystemConfig).where(SystemConfig.id == 1))
-    top_k = resolve_retrieval_top_k(
-        getattr(sys_row.scalar_one_or_none(), "config", None)
-    )
-    chunks = await retrieve(session, query, top_k=top_k, session_id=session_id)
+    sys_config = getattr(sys_row.scalar_one_or_none(), "config", None)
+    top_k = resolve_retrieval_top_k(sys_config)
+    max_files = resolve_retrieval_max_files(sys_config)
+    ranked = await retrieve(session, query, top_k=top_k, session_id=session_id)
+
+    # Apply the distinct-file cap. Walk in RRF rank order, admit chunks
+    # whose document is already in the kept set, or whose document is a
+    # new doc and we haven't hit `max_files` yet. Preserves per-file
+    # rank order; just drops chunks belonging to lower-ranked documents.
+    kept_docs: set[uuid.UUID] = set()
+    chunks: list[RetrievedChunk] = []
+    for c in ranked:
+        if c.document_id in kept_docs:
+            chunks.append(c)
+        elif len(kept_docs) < max_files:
+            kept_docs.add(c.document_id)
+            chunks.append(c)
 
     # Pull the filename + storage path for every cited document so the UI can
     # render clickable source chips. Public bucket URLs are built directly;

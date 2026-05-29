@@ -4,29 +4,55 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, model_validator
 
-# Defaults + bounds for the retrieval top-K knob. The cap matches the
-# clamp in the corpus-search endpoint (documents.py) so the two surfaces
-# agree on a sane ceiling.
+# Defaults + bounds for the retrieval knobs.
+#
+# `retrieval_top_k` caps the chunk count (prompt budget). Its 20 ceiling
+# matches the clamp in the corpus-search endpoint (documents.py).
+#
+# `retrieval_max_files` caps the number of distinct source documents
+# represented in the answer — controls citation focus and stops a
+# single doc from monopolising the context. Walk chunks in RRF rank
+# order, keep chunks whose document is among the first N distinct
+# documents seen.
 DEFAULT_RETRIEVAL_TOP_K = 8
 MIN_RETRIEVAL_TOP_K = 1
 MAX_RETRIEVAL_TOP_K = 20
 
+DEFAULT_RETRIEVAL_MAX_FILES = 3
+MIN_RETRIEVAL_MAX_FILES = 1
+MAX_RETRIEVAL_MAX_FILES = 10
 
-def resolve_retrieval_top_k(config: dict | None) -> int:
-    """Read retrieval_top_k from a stored config blob, clamping to bounds.
 
-    Used by chat.py at request time so an out-of-range value sitting in
-    the DB (set before bounds were tightened, or via direct SQL) can't
-    explode the retrieval call.
-    """
-    if not config:
-        return DEFAULT_RETRIEVAL_TOP_K
-    raw = config.get("retrieval_top_k", DEFAULT_RETRIEVAL_TOP_K)
+def _clamp_int(raw, default: int, lo: int, hi: int) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError):
+        return default
+    return max(lo, min(value, hi))
+
+
+def resolve_retrieval_top_k(config: dict | None) -> int:
+    """Read retrieval_top_k from a stored config blob, clamping to bounds."""
+    if not config:
         return DEFAULT_RETRIEVAL_TOP_K
-    return max(MIN_RETRIEVAL_TOP_K, min(value, MAX_RETRIEVAL_TOP_K))
+    return _clamp_int(
+        config.get("retrieval_top_k", DEFAULT_RETRIEVAL_TOP_K),
+        DEFAULT_RETRIEVAL_TOP_K,
+        MIN_RETRIEVAL_TOP_K,
+        MAX_RETRIEVAL_TOP_K,
+    )
+
+
+def resolve_retrieval_max_files(config: dict | None) -> int:
+    """Read retrieval_max_files from a stored config blob, clamping to bounds."""
+    if not config:
+        return DEFAULT_RETRIEVAL_MAX_FILES
+    return _clamp_int(
+        config.get("retrieval_max_files", DEFAULT_RETRIEVAL_MAX_FILES),
+        DEFAULT_RETRIEVAL_MAX_FILES,
+        MIN_RETRIEVAL_MAX_FILES,
+        MAX_RETRIEVAL_MAX_FILES,
+    )
 
 
 class SystemConfigOut(BaseModel):
@@ -38,17 +64,25 @@ class SystemConfigIn(BaseModel):
     config: dict = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _validate_retrieval_top_k(self) -> "SystemConfigIn":
-        raw = self.config.get("retrieval_top_k")
+    def _validate(self) -> "SystemConfigIn":
+        self._validate_int_field(
+            "retrieval_top_k", MIN_RETRIEVAL_TOP_K, MAX_RETRIEVAL_TOP_K
+        )
+        self._validate_int_field(
+            "retrieval_max_files",
+            MIN_RETRIEVAL_MAX_FILES,
+            MAX_RETRIEVAL_MAX_FILES,
+        )
+        return self
+
+    def _validate_int_field(self, key: str, lo: int, hi: int) -> None:
+        raw = self.config.get(key)
         if raw is None:
-            return self
+            return
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            raise ValueError("retrieval_top_k must be an integer")
-        if not MIN_RETRIEVAL_TOP_K <= value <= MAX_RETRIEVAL_TOP_K:
-            raise ValueError(
-                f"retrieval_top_k must be between {MIN_RETRIEVAL_TOP_K} and {MAX_RETRIEVAL_TOP_K}"
-            )
-        self.config["retrieval_top_k"] = value
-        return self
+            raise ValueError(f"{key} must be an integer")
+        if not lo <= value <= hi:
+            raise ValueError(f"{key} must be between {lo} and {hi}")
+        self.config[key] = value
