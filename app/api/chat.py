@@ -14,7 +14,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 from app.core.auth import AuthUser, get_current_user_optional
 from app.core.db import _sessionmaker
@@ -24,6 +24,26 @@ from app.schemas.chat import ChatRequest
 from app.services.chat import stream_answer
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+# Auto-title length cap. Titles are derived from the first user message and
+# truncated to this many characters (ellipsis included). Kept in sync with
+# the chat_sessions.title column width and the FE sidebar's expectations.
+_TITLE_MAX = 40
+
+
+def _make_title(text: str) -> str:
+    """Derive a session title from the first user message.
+
+    Collapses whitespace and truncates to _TITLE_MAX chars with a trailing
+    ellipsis. Empty/whitespace-only input falls back to a generic label so a
+    session always has a usable title in the sidebar.
+    """
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return "New chat"
+    if len(cleaned) <= _TITLE_MAX:
+        return cleaned
+    return cleaned[: _TITLE_MAX - 1].rstrip() + "…"
 
 
 async def _current_chat_mode() -> str:
@@ -77,10 +97,16 @@ async def chat(
     sessionmaker_ = _sessionmaker()
 
     # Resolve or create the chat session in its own short-lived DB session.
+    # A brand-new session is stamped with the caller's user id (NULL for
+    # anonymous public-widget visitors) and an auto-title from the first
+    # user message — both back the per-user session sidebar.
     chat_session_id: uuid.UUID
     if body.session_id is None:
         async with sessionmaker_() as sess:
-            new_session = ChatSession()
+            new_session = ChatSession(
+                user_id=uuid.UUID(user.sub) if user and user.sub else None,
+                title=_make_title(last_user.content),
+            )
             sess.add(new_session)
             await sess.commit()
             await sess.refresh(new_session)
@@ -88,7 +114,8 @@ async def chat(
     else:
         chat_session_id = body.session_id
 
-    # Persist the user turn before streaming.
+    # Persist the user turn before streaming, and bump the session's
+    # last-activity stamp so the sidebar orders by most-recently-used.
     async with sessionmaker_() as sess:
         sess.add(
             ChatMessage(
@@ -96,6 +123,11 @@ async def chat(
                 role=MessageRole.user,
                 content=last_user.content,
             )
+        )
+        await sess.execute(
+            update(ChatSession)
+            .where(ChatSession.id == chat_session_id)
+            .values(last_message_at=func.now())
         )
         await sess.commit()
 

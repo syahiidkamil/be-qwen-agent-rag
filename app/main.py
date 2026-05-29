@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import chat as chat_router
+from app.api import chat_sessions as chat_sessions_router
 from app.api import documents as documents_router
 from app.api import landing_config as landing_config_router
 from app.api import system_config as system_config_router
@@ -30,6 +31,7 @@ app.add_middleware(
 
 app.include_router(documents_router.router)
 app.include_router(chat_router.router)
+app.include_router(chat_sessions_router.router)
 app.include_router(landing_config_router.router)
 app.include_router(system_config_router.router)
 app.include_router(users_router.router)
